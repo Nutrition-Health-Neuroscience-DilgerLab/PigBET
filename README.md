@@ -47,11 +47,11 @@
 We **do not** include the `example_imgs/` or `model_checkpoints/` folders in this repository. Instead, you can download them separately:
 
 - **Example Images** (sample `.nii.gz` files):  
-  [Download here](https://uillinoisedu-my.sharepoint.com/:f:/g/personal/zimul3_illinois_edu/EmqcOq0y1TJCuzI_tZABuP8BKdGuOfEOrmDB9zyXpuaWaA?e=NVVwt0)  
+  [Download here](https://uofi.box.com/s/8i69qd5xqvrwin8w0kjr4n0nren7npfi)  
   
 
 - **Model Checkpoints** (pretrained `.pth` files):  
-  [Download here](https://uillinoisedu-my.sharepoint.com/:f:/g/personal/zimul3_illinois_edu/EmqcOq0y1TJCuzI_tZABuP8BKdGuOfEOrmDB9zyXpuaWaA?e=NVVwt0)  
+  [Download here](https://uofi.box.com/s/bsxz5wmbqc42hftwixwyexxf3i97qoyo)  
   
 
 After downloading, place the sample images in a folder (e.g., `example_imgs`) and the `.pth` files in a folder (e.g., `model_checkpoints`). Update paths in your notebooks or scripts to match these locations.
@@ -64,7 +64,7 @@ After downloading, place the sample images in a folder (e.g., `example_imgs`) an
    ```bash
    jupyter notebook inference_flex.ipynb
 
-2. **Adjust** the paths at the top (e.g., `images_dir`, `model_sag_path`, etc.) to match your file locations.
+2. **Adjust** the paths at the top (e.g., `images_dir`, `model_sag_path`, etc.) to match your file locations. also adjust the dimension variables to match the dimensions of your images. Also make sure that images that need to be processed are ending in the same name as "image_fixed" flag in cell 3. If you cannot find the flag rename them to img_fixed = "_t1w".
 
 3. **Run** all cells.  
    - The notebook will slice each volume into 2.5D images, run inference in all three planes, then optionally combine them via majority vote.  
@@ -94,8 +94,9 @@ If you want to **train** or **fine‐tune** models:
 
 1. **Open** `train.ipynb` in Jupyter.  
 2. **Point** it to your training images and ground‐truth masks.  
-3. **Customize** hyperparameters (epochs, encoder type, learning rate) in the first few cells.  
-4. **Run** all cells. Checkpoints (`.pth`) are saved periodically. You can then use those new weights in either the notebook or script for inference.
+3. **Make sure** your image files ends in the specified ending (example in notebook img_fixed = "_mc_restore") and your mask files ends in "-mask".
+4. **Customize** hyperparameters (epochs, encoder type, learning rate) in the first few cells.  
+5. **Run** all cells. Checkpoints (`.pth`) are saved periodically. You can then use those new weights in either the notebook or script for inference.
 
 ---
 
