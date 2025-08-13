@@ -1,4 +1,4 @@
-# PigNii Skullstrip
+# PigBET
 
 **PigNii Skullstrip** is a 2.5D deep learning approach for automated segmentation (skull stripping) of pig brains from MRI images. This repository includes scripts and notebooks for both **inference** (generating segmentation masks) and **training** (building or fine‐tuning your own models via transfer learning).
 
