@@ -21,6 +21,7 @@ import pre_proc_functions as proc
 from natsort import natsorted
 import pandas as pd
 import shutil
+import math
 
 def iou_score(output, target):
     intersection = np.logical_and(output, target).sum()
@@ -61,20 +62,16 @@ def display(display_list, epoch=0, save_path=None, is_inference = False, inferen
     # If display_list[2] is a PyTorch tensor, convert it to a numpy array
     if inference_path:
         if isinstance(display_list[2], torch.Tensor):
-            print('tocpu.........................................')
             img_array = display_list[2].cpu().numpy()
         else:
             img_array = display_list[2]
 
         # Normalize the array to 0-255 if it's floating point, as OpenCV expects uint8 type for grayscale images
         if img_array.dtype == np.float32 or img_array.dtype == np.float64:
-            print('converting.........................................')
             img_array = np.where(img_array > 0, 1, 0).astype(np.uint8) * 255
             #img_array = (255.0 * img_array).clip(0, 255).astype(np.uint8)
 
         # Save the array as a PNG using OpenCV
-        print(f'writing to {inference_path}/{epoch}.png')
-        print(img_array.shape)
         if not cv2.imwrite(f'{inference_path}/{epoch}.png', img_array):
             print(img_array.dtype)
             print("Error saving the image!")
@@ -129,9 +126,12 @@ class Dataset(BaseDataset):
             masks_dir=None, 
             classes=None, 
             augmentation=None, 
-            preprocessing=None,
+        preprocessing=None,
     ):
-        self.ids = os.listdir(images_dir)
+        self.ids = sorted(
+            image_id for image_id in os.listdir(images_dir)
+            if os.path.isfile(os.path.join(images_dir, image_id))
+        )
         self.images_fps = [os.path.join(images_dir, image_id) for image_id in self.ids]
         #self.masks_fps = [os.path.join(masks_dir, os.path.splitext(image_id)[0] + "_mask" + os.path.splitext(image_id)[1]) for image_id in self.ids]
         
@@ -206,62 +206,127 @@ def get_files_starting_with(directory, prefix):
     """Return a list of full paths of files in the directory starting with the specified prefix."""
     return [os.path.join(directory, filename) for filename in os.listdir(directory) if filename.startswith(prefix)]
 
-def stack_slices_and_save_nifti(input_dir, output_dir, source_dir, direction=0):
+
+def get_image_hw(image_path):
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image slice: {image_path}")
+    return image.shape[:2]
+
+
+def unpad_array_to_shape(array, original_height, original_width):
+    if array.shape[0] < original_height or array.shape[1] < original_width:
+        raise ValueError(
+            f"Cannot unpad array of shape {array.shape} to {(original_height, original_width)}."
+        )
+
+    total_pad_height = array.shape[0] - original_height
+    total_pad_width = array.shape[1] - original_width
+
+    remove_top = total_pad_height // 2
+    remove_bottom = total_pad_height - remove_top
+    remove_left = total_pad_width // 2
+    remove_right = total_pad_width - remove_left
+
+    row_end = array.shape[0] - remove_bottom if remove_bottom else array.shape[0]
+    col_end = array.shape[1] - remove_right if remove_right else array.shape[1]
+    return array[remove_top:row_end, remove_left:col_end]
+
+
+def _slice_prefix(filename):
+    match = re.match(r'(.+)_slice\d+\.npy$', filename)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _mask_prefix(filename):
+    for suffix in ('_mask.nii.gz', '_mask.nii'):
+        if filename.endswith(suffix):
+            return filename[:-len(suffix)]
+    return None
+
+
+def stack_slices_and_save_nifti(input_dir, output_dir, source_dir, direction=0, img_fixed="_mc_restore"):
     """
     Stack 2D slice images into 3D volumes and save as NIfTI files with original header, specifying stacking direction.
     
     Args:
     - input_dir (str): Directory containing the 2D slice `.npy` files.
     - output_dir (str): Directory where the 3D NIfTI volumes will be saved.
-    - source_dir (str): Directory containing the original NIfTI files for header information.
+    - source_dir (str | dict): Directory containing the original NIfTI files for header information,
+      or a precomputed prefix -> source file mapping.
     - direction (int): Stacking direction as an integer (0=sagittal, 1=coronal, 2=axial).
     """
     os.makedirs(output_dir, exist_ok=True)
-    pattern = re.compile(r'Pig_((?:\d+[a-zA-Z]?)+)_slice\d+\.npy')
-    
-    pigs = set()
-    for file in os.listdir(input_dir):
-        match = pattern.match(file)
-        if match:
-            pigs.add(match.group(1))
-    
-    for pig in pigs:
-        source_file = None
-        for file in os.listdir(source_dir):
-            if f'Pig_{pig}_mc_restore.nii.gz' in file:
-                source_file = os.path.join(source_dir, file)
-                break
-        
+    if isinstance(source_dir, dict):
+        source_map = source_dir
+    else:
+        source_map = proc.build_source_image_map(source_dir, img_fixed=img_fixed)
+
+    prefixes = sorted({
+        prefix for prefix in (_slice_prefix(file) for file in os.listdir(input_dir))
+        if prefix is not None
+    })
+
+    for prefix in prefixes:
+        source_file = source_map.get(prefix)
         if not source_file:
-            print(f"No source NIfTI file found for Pig {pig}. Skipping.")
+            print(f"No source NIfTI file found for {prefix}. Skipping.")
             continue
-        
+
         source_nifti = nib.load(source_file)
-        
+
         slices = []
-        slice_files = [file for file in os.listdir(input_dir) if re.match(rf'^Pig_{pig}_slice\d+\.npy$', file)]
+        slice_files = [
+            file for file in os.listdir(input_dir)
+            if file.startswith(f'{prefix}_slice') and file.endswith('.npy')
+        ]
         if not slice_files:
-            print(f"No slice files found for Pig {pig}. Skipping.")
+            print(f"No slice files found for {prefix}. Skipping.")
             continue
-        
+
         # Sort slice files naturally
-        pig_files = natsorted(slice_files)
-        for file_name in pig_files:
+        slice_files = natsorted(slice_files)
+        for file_name in slice_files:
             slice_path = os.path.join(input_dir, file_name)
             slice_data = np.load(slice_path)
             if np.all(slice_data == 1):
                 slice_data = np.zeros_like(slice_data)
             slices.append(slice_data)
-        
+
         # Adjust axis based on direction input
         volume = np.stack(slices, axis=direction)
-        
-        new_nifti = nib.Nifti1Image(volume, affine=source_nifti.affine, header=source_nifti.header)
-        output_path = os.path.join(output_dir, f'Pig_{pig}_mask.nii.gz')
-        nib.save(new_nifti, output_path)
-        print(f"Saved 3D NIfTI volume for Pig {pig} to {output_path}")
+        expected_shape = tuple(source_nifti.shape[:3])
+        if volume.shape != expected_shape:
+            raise RuntimeError(
+                f"Reconstructed mask shape mismatch for {prefix}: got {volume.shape}, expected {expected_shape}. "
+                "Check slice padding/unpadding before stacking."
+            )
 
-def run_fslmaths(dir_sag, dir_cor, dir_ax, output_dir):
+        new_nifti = nib.Nifti1Image(volume, affine=source_nifti.affine, header=source_nifti.header.copy())
+        output_path = os.path.join(output_dir, f'{prefix}_mask.nii.gz')
+        nib.save(new_nifti, output_path)
+        print(f"Saved 3D NIfTI volume for {prefix} to {output_path}")
+
+
+def _combine_masks_python(mask_paths, output_path):
+    loaded_masks = [nib.load(mask_path) for mask_path in mask_paths]
+    mask_stack = np.stack([
+        (np.asarray(mask_nii.get_fdata()) > 0.5).astype(np.uint8)
+        for mask_nii in loaded_masks
+    ], axis=0)
+    votes_needed = math.ceil(mask_stack.shape[0] / 2)
+    combined_mask = (mask_stack.sum(axis=0) >= votes_needed).astype(np.uint8)
+    template = loaded_masks[0]
+    nib.save(
+        nib.Nifti1Image(combined_mask, affine=template.affine, header=template.header.copy()),
+        output_path,
+    )
+    print(f"Processed and saved: {output_path}")
+
+
+def run_fslmaths(dir_sag, dir_cor, dir_ax, output_dir, prefer_fsl=False):
     """
     Combines masks from three directories using fslmaths and saves the output.
     
@@ -273,29 +338,45 @@ def run_fslmaths(dir_sag, dir_cor, dir_ax, output_dir):
     """
     # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Compile a regex pattern to extract the Pig_XXXX identifier
-    pattern = re.compile(r'Pig_((?:\d+[a-zA-Z]?)+)_mask.nii.gz')
-    
-    # Gather all unique Pig identifiers across the three directories
-    pigs = set()
+
+    mask_maps = []
     for dir_path in [dir_sag, dir_cor, dir_ax]:
+        current_map = {}
         for filename in os.listdir(dir_path):
-            match = pattern.match(filename)
-            if match:
-                pigs.add(match.group(1))
-    
-    # For each unique Pig identifier, construct and run the fslmaths command
-    for pig in pigs:
-        masks = [os.path.join(dir_path, f'Pig_{pig}_mask.nii.gz') for dir_path in [dir_sag, dir_cor, dir_ax]]
-        output_path = os.path.join(output_dir, f'Pig_{pig}_mask.nii.gz')
-        
-        # Construct the fslmaths command
-        cmd = ["fslmaths", masks[0], "-add", masks[1], "-add", masks[2], "-thr", "1.5", "-bin", output_path]
-        
-        # Execute the command
-        subprocess.run(cmd, check=True)
-        print(f"Processed and saved: {output_path}")
+            prefix = _mask_prefix(filename)
+            if prefix is not None:
+                current_map[prefix] = os.path.join(dir_path, filename)
+        mask_maps.append(current_map)
+
+    prefixes = sorted(set().union(*(mask_map.keys() for mask_map in mask_maps)))
+    fslmaths_path = shutil.which("fslmaths") if prefer_fsl else None
+
+    for prefix in prefixes:
+        masks = [mask_map[prefix] for mask_map in mask_maps if prefix in mask_map]
+        if len(masks) < 2:
+            print(f"Skipping {prefix}: need at least two directional masks, found {len(masks)}.")
+            continue
+
+        output_path = os.path.join(output_dir, f'{prefix}_mask.nii.gz')
+
+        if fslmaths_path and len(masks) == 3:
+            cmd = [
+                fslmaths_path,
+                masks[0],
+                "-add",
+                masks[1],
+                "-add",
+                masks[2],
+                "-thr",
+                "1.5",
+                "-bin",
+                output_path,
+            ]
+            subprocess.run(cmd, check=True)
+            print(f"Processed and saved: {output_path}")
+            continue
+
+        _combine_masks_python(masks, output_path)
 
 def dice_coefficient(prediction, truth):
     """Compute the Dice coefficient."""

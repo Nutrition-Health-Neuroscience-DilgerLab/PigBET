@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+
+# Imaging data and model weights
+*.nii
+*.nii.gz
+*.pth
+*.pt
+*.ckpt
+
+# Local datasets / checkpoints
+Checkpoints-selected/
+Example_images-selected/
+
+# Generated inference artifacts
+raw_png/
+raw_png_output/
+raw_npy_output/
+prob_out/
+volumn_out/
+final_out/
+run_*/
+test_*/
+test_run_*/
+test_input_*/
+
+# Metrics / scratch outputs
+*.npy

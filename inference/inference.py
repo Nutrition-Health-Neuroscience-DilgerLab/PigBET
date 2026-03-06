@@ -1,283 +1,312 @@
-import nibabel as nib
-import imageio
+import argparse
+from pathlib import Path
+
 import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-import os
-import torch.optim as optim
-import torch.nn as nn
-from tqdm.notebook import tqdm
-from PIL import Image
-from torchvision import transforms
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset as BaseDataset
 import torch
 import segmentation_models_pytorch as smp
-import albumentations as albu
-from PIL import Image
-import re
-import subprocess
-import pre_proc_functions as proc
-from natsort import natsorted
-import pandas as pd
-import shutil
+
 import inference_flex_functions as inf
+import pre_proc_functions as proc
+
+
+VIEW_CONFIG = {
+    "sag": {"checkpoint_arg": "model_sag_path", "stack_axis": 2},
+    "cor": {"checkpoint_arg": "model_cor_path", "stack_axis": 1},
+    "ax": {"checkpoint_arg": "model_ax_path", "stack_axis": 0},
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run PigBET inference on CPU, Metal/MPS, or CUDA."
+    )
+
+    parser.add_argument(
+        "--images_dir",
+        type=str,
+        default="Example_images-selected",
+        help="Path to the input directory containing NIfTI volumes.",
+    )
+    parser.add_argument(
+        "--study_name",
+        type=str,
+        default="res",
+        help="Output directory prefix for inference artifacts.",
+    )
+    parser.add_argument(
+        "--metrics_out",
+        type=str,
+        default=None,
+        help="Optional directory prefix for metrics outputs.",
+    )
+    parser.add_argument(
+        "--truth_folder",
+        type=str,
+        default=None,
+        help="Optional directory containing ground-truth masks for metrics.",
+    )
+
+    parser.add_argument(
+        "--model_sag_path",
+        type=str,
+        default="Checkpoints-selected/Unet_efficientnet-b3_sag.pth",
+        help="Path to the sagittal checkpoint.",
+    )
+    parser.add_argument(
+        "--model_cor_path",
+        type=str,
+        default="Checkpoints-selected/Unet_efficientnet-b3_cor.pth",
+        help="Path to the coronal checkpoint.",
+    )
+    parser.add_argument(
+        "--model_ax_path",
+        type=str,
+        default="Checkpoints-selected/Unet_efficientnet-b3_ax.pth",
+        help="Path to the axial checkpoint.",
+    )
+
+    parser.add_argument(
+        "--encoder_type",
+        type=str,
+        default="efficientnet-b3",
+        help="Encoder name for the segmentation model.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "metal", "mps"],
+        help="Inference backend. 'metal' maps to PyTorch MPS on Apple Silicon.",
+    )
+    parser.add_argument(
+        "--image_suffix",
+        type=str,
+        default="_mc_restore",
+        help="Suffix before .nii/.nii.gz used to match source images. Use '' to accept all NIfTI files.",
+    )
+    parser.add_argument(
+        "--mask_threshold",
+        type=float,
+        default=0.5,
+        help="Probability threshold for converting sigmoid outputs into binary masks.",
+    )
+    parser.add_argument(
+        "--prefer_fsl",
+        action="store_true",
+        help="Use fslmaths for majority voting when it is available; otherwise a Python fallback is used.",
+    )
+
+    # Legacy args kept for CLI compatibility with the original script.
+    parser.add_argument("--sag_dim", nargs=2, type=int, default=[288, 288], help=argparse.SUPPRESS)
+    parser.add_argument("--cor_dim", nargs=2, type=int, default=[256, 288], help=argparse.SUPPRESS)
+    parser.add_argument("--ax_dim", nargs=2, type=int, default=[256, 288], help=argparse.SUPPRESS)
+
+    return parser.parse_args()
+
+
+def resolve_device(device_name):
+    requested = "mps" if device_name == "metal" else device_name
+
+    if requested == "auto":
+        if torch.cuda.is_available():
+            requested = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            requested = "mps"
+        else:
+            requested = "cpu"
+
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but no CUDA device is available.")
+
+    if requested == "mps":
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if not mps_available:
+            raise RuntimeError("Metal/MPS was requested, but PyTorch MPS is not available.")
+
+    return torch.device(requested)
+
+
+def clear_device_cache(device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
+def torch_load(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def build_model(encoder_type):
+    return smp.Unet(
+        encoder_name=encoder_type,
+        encoder_weights=None,
+        in_channels=3,
+        classes=1,
+        activation=None,
+    )
+
+
+def load_model(checkpoint_path, encoder_type, device):
+    checkpoint = torch_load(checkpoint_path, map_location=device)
+
+    if isinstance(checkpoint, torch.nn.Module):
+        model = checkpoint
+    elif isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif checkpoint and all(isinstance(key, str) for key in checkpoint):
+            state_dict = checkpoint
+        else:
+            raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
+
+        model = build_model(encoder_type)
+        model.load_state_dict(state_dict)
+    else:
+        raise RuntimeError(f"Unsupported checkpoint type for {checkpoint_path}: {type(checkpoint)}")
+
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def ensure_view_dirs(base_dir):
+    base_dir.mkdir(parents=True, exist_ok=True)
+    view_dirs = {}
+    for view in VIEW_CONFIG:
+        view_path = base_dir / view
+        view_path.mkdir(parents=True, exist_ok=True)
+        view_dirs[view] = view_path
+    return view_dirs
+
+
+def collect_png_files(directory):
+    return sorted(str(path) for path in Path(directory).glob("*.png"))
+
+
+def run_view_inference(view, model, dataset, image_dir, output_mask_dir, output_prob_dir, output_png_dir, threshold, device):
+    files = collect_png_files(image_dir)
+    if not files:
+        raise RuntimeError(f"No PNG slices were generated for the {view} view in {image_dir}.")
+
+    print(f"[INFO] Running {view} inference on {len(files)} slices using {device.type}.")
+    with torch.inference_mode():
+        for index, filename in enumerate(files, start=1):
+            image = inf.get_data_from_filename(filename, dataset)
+            batch = torch.from_numpy(image).unsqueeze(0).to(device=device, dtype=torch.float32)
+            logits = model(batch).squeeze(0).squeeze(0)
+            probabilities = torch.sigmoid(logits).cpu().numpy().astype(np.float32)
+            mask = (probabilities >= threshold).astype(np.uint8)
+            original_height, original_width = inf.get_image_hw(filename)
+            probabilities = inf.unpad_array_to_shape(probabilities, original_height, original_width).astype(np.float32)
+            mask = inf.unpad_array_to_shape(mask, original_height, original_width).astype(np.uint8)
+
+            base_name = Path(filename).stem
+            np.save(output_prob_dir / f"{base_name}.npy", probabilities)
+            np.save(output_mask_dir / f"{base_name}.npy", mask)
+            inf.display(
+                [None, None, mask],
+                epoch=base_name,
+                save_path=None,
+                is_inference=True,
+                inference_path=str(output_png_dir),
+            )
+            if index == 1 or index == len(files) or index % 25 == 0:
+                print(f"[INFO] {view}: {index}/{len(files)} -> {base_name}")
+
+
+def maybe_write_metrics(final_out, volume_out, truth_folder, metrics_out):
+    if not metrics_out or not truth_folder:
+        return
+
+    metrics_prefix = Path(metrics_out)
+    metrics_prefix.parent.mkdir(parents=True, exist_ok=True)
+    inf.calc3dDice(str(final_out), str(volume_out), truth_folder, f"{metrics_out}_dice.csv")
+    inf.calc3dIOU(str(final_out), str(volume_out), truth_folder, f"{metrics_out}_iou.csv")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference script with specified command-line arguments.")
+    args = parse_args()
+    device = resolve_device(args.device)
 
-    # Directories
-    parser.add_argument("--images_dir", 
-                        type=str, 
-                        default="PigNii_skullstrip-main/PigNii_skullstrip-main/example_imgs",
-                        help="Path to input directory of images.")
-    parser.add_argument("--study_name", 
-                        type=str, 
-                        default="res",
-                        help="User-defined study name for outputs.")
-    parser.add_argument("--metrics_out", 
-                        type=str, 
-                        default="res",
-                        help="If set, path to store metrics, e.g. 'res.csv'.")
-    parser.add_argument("--truth_folder", 
-                        type=str, 
-                        default="masks_swapped_val",
-                        help="Folder containing ground truth masks (if you want to compute metrics).")
+    print(f"images_dir:      {args.images_dir}")
+    print(f"study_name:      {args.study_name}")
+    print(f"encoder_type:    {args.encoder_type}")
+    print(f"device:          {device.type}")
+    print(f"image_suffix:    {repr(args.image_suffix)}")
+    print(f"mask_threshold:  {args.mask_threshold}")
+    print(f"prefer_fsl:      {args.prefer_fsl}")
 
-    # Model checkpoints
-    parser.add_argument("--model_sag_path", 
-                        type=str, 
-                        default="PigNii_skullstrip-main/PigNii_skullstrip-main/model_checkpoints/Unet_efficientnet-b3_sag.pth",
-                        help="Path to sagittal .pth checkpoint.")
-    parser.add_argument("--model_cor_path", 
-                        type=str, 
-                        default="PigNii_skullstrip-main/PigNii_skullstrip-main/model_checkpoints/Unet_efficientnet-b3_cor.pth",
-                        help="Path to coronal .pth checkpoint.")
-    parser.add_argument("--model_ax_path", 
-                        type=str, 
-                        default="PigNii_skullstrip-main/PigNii_skullstrip-main/model_checkpoints/Unet_efficientnet-b3_ax.pth",
-                        help="Path to axial .pth checkpoint.")
+    images_dir = Path(args.images_dir)
+    study_dir = Path(args.study_name)
 
-    # Encoder type
-    parser.add_argument("--encoder_type", 
-                        type=str, 
-                        default="efficientnet-b3",
-                        help="Encoder name for segmentation model (e.g. efficientnet-b3).")
+    source_map = proc.build_source_image_map(str(images_dir), img_fixed=args.image_suffix)
+    if not source_map:
+        raise RuntimeError(
+            f"No input NIfTI files matched in {images_dir} with image_suffix={repr(args.image_suffix)}."
+        )
 
-    # Image dimensions
-    parser.add_argument("--sag_dim",
-                        nargs=2, 
-                        type=int, 
-                        default=[288, 288],
-                        help="Height,Width for sagittal images.")
-    parser.add_argument("--cor_dim",
-                        nargs=2, 
-                        type=int, 
-                        default=[256, 288],
-                        help="Height,Width for coronal images.")
-    parser.add_argument("--ax_dim",
-                        nargs=2, 
-                        type=int, 
-                        default=[256, 288],
-                        help="Height,Width for axial images.")
+    raw_png_dir = ensure_view_dirs(study_dir / "raw_png")
+    raw_png_output_dir = ensure_view_dirs(study_dir / "raw_png_output")
+    raw_npy_output_dir = ensure_view_dirs(study_dir / "raw_npy_output")
+    volume_out_dir = ensure_view_dirs(study_dir / "volumn_out")
+    prob_out_dir = ensure_view_dirs(study_dir / "prob_out")
+    final_out_dir = study_dir / "final_out"
+    final_out_dir.mkdir(parents=True, exist_ok=True)
 
-    args = parser.parse_args()
+    proc.proc_img_masks(
+        img_dir=str(images_dir),
+        out_dir=str(study_dir / "raw_png"),
+        img_fixed=args.image_suffix,
+        mask_fixed="-mask",
+    )
 
-    # Print them out or use them in your pipeline
-    print(f"images_dir:    {args.images_dir}")
-    print(f"study_name:    {args.study_name}")
-    print(f"metrics_out:   {args.metrics_out}")
-    print(f"truth_folder:  {args.truth_folder}")
-    print()
-    print(f"model_sag_path:{args.model_sag_path}")
-    print(f"model_cor_path:{args.model_cor_path}")
-    print(f"model_ax_path: {args.model_ax_path}")
-    print()
-    print(f"encoder_type:  {args.encoder_type}")
-    print()
-    print(f"sag_dim:       {args.sag_dim}")
-    print(f"cor_dim:       {args.cor_dim}")
-    print(f"ax_dim:        {args.ax_dim}")
-
-    images_output_dir = args.study_name + "/raw_png"
-    raw_png_output = args.study_name + '/raw_png_output'
-    raw_npy_output = args.study_name + '/raw_npy_output'
-    volumn_out = args.study_name + "/volumn_out"
-    prob_out = args.study_name + "/prob_out"
-    final_out = args.study_name + '/final_out'
-
-    if not os.path.exists(images_output_dir):
-        os.makedirs(images_output_dir)
-        os.makedirs(os.path.join(images_output_dir,'sag'))
-        os.makedirs(os.path.join(images_output_dir,'ax'))
-        os.makedirs(os.path.join(images_output_dir,'cor'))
-    raw_png_sag = os.path.join(images_output_dir,'sag')
-    raw_png_ax = os.path.join(images_output_dir,'ax')
-    raw_png_cor = os.path.join(images_output_dir,'cor')
-
-    if not os.path.exists(raw_png_output):
-        os.makedirs(raw_png_output)
-        os.makedirs(os.path.join(raw_png_output,'sag'))
-        os.makedirs(os.path.join(raw_png_output,'ax'))
-        os.makedirs(os.path.join(raw_png_output,'cor'))
-
-    raw_png_sag_output = os.path.join(raw_png_output,'sag')
-    raw_png_ax_output = os.path.join(raw_png_output,'ax')
-    raw_png_cor_output = os.path.join(raw_png_output,'cor')
-
-    if not os.path.exists(raw_npy_output):
-        os.makedirs(raw_npy_output)
-        os.makedirs(os.path.join(raw_npy_output,'sag'))
-        os.makedirs(os.path.join(raw_npy_output,'ax'))
-        os.makedirs(os.path.join(raw_npy_output,'cor'))
-
-    raw_npy_sag_output = os.path.join(raw_npy_output,'sag')
-    raw_npy_ax_output = os.path.join(raw_npy_output,'ax')
-    raw_npy_cor_output = os.path.join(raw_npy_output,'cor')
-
-    if not os.path.exists(volumn_out):
-        os.makedirs(volumn_out)
-        os.makedirs(os.path.join(volumn_out,'sag'))
-        os.makedirs(os.path.join(volumn_out,'ax'))
-        os.makedirs(os.path.join(volumn_out,'cor'))
-
-    volumn_out_sag = os.path.join(volumn_out,'sag')
-    volumn_out_ax = os.path.join(volumn_out,'ax')
-    volumn_out_cor = os.path.join(volumn_out,'cor')
-
-    if not os.path.exists(prob_out):
-        os.makedirs(prob_out)
-        os.makedirs(os.path.join(prob_out,'sag'))
-        os.makedirs(os.path.join(prob_out,'ax'))
-        os.makedirs(os.path.join(prob_out,'cor'))
-
-    prob_out_sag = os.path.join(prob_out,'sag')
-    prob_out_ax = os.path.join(prob_out,'ax')
-    prob_out_cor = os.path.join(prob_out,'cor')
-
-    proc.proc_img_masks(img_dir=args.images_dir, out_dir=images_output_dir,img_fixed = "_mc_restore", mask_fixed = '-mask')
-
-    files_list_sag = inf.get_files_starting_with(raw_png_sag, "Pig")
-    print(sorted(files_list_sag))
-    files_list_sag = sorted(files_list_sag)
-
-    files_list_ax = inf.get_files_starting_with(raw_png_ax, "Pig")
-    print(sorted(files_list_ax))
-    files_list_ax = sorted(files_list_ax)
-
-    files_list_cor = inf.get_files_starting_with(raw_png_cor, "Pig")
-    print(sorted(files_list_cor))
-    files_list_cor = sorted(files_list_cor)
-
-    model_sag = torch.load(args.model_sag_path)
-    model_cor = torch.load(args.model_cor_path)
-    model_ax = torch.load(args.model_ax_path)
     preprocessing_fn = smp.encoders.get_preprocessing_fn(args.encoder_type, "imagenet")
-    sag_dataset = inf.Dataset(
-        images_dir = raw_png_sag, 
-        preprocessing=inf.get_preprocessing(preprocessing_fn),
-        classes=['brain'],
+    preprocessing = inf.get_preprocessing(preprocessing_fn)
+
+    for view, config in VIEW_CONFIG.items():
+        checkpoint_path = getattr(args, config["checkpoint_arg"])
+        model = load_model(checkpoint_path, args.encoder_type, device)
+        dataset = inf.Dataset(
+            images_dir=str(raw_png_dir[view]),
+            preprocessing=preprocessing,
+            classes=["brain"],
+        )
+        run_view_inference(
+            view=view,
+            model=model,
+            dataset=dataset,
+            image_dir=raw_png_dir[view],
+            output_mask_dir=raw_npy_output_dir[view],
+            output_prob_dir=prob_out_dir[view],
+            output_png_dir=raw_png_output_dir[view],
+            threshold=args.mask_threshold,
+            device=device,
+        )
+        clear_device_cache(device)
+
+    for view, config in VIEW_CONFIG.items():
+        inf.stack_slices_and_save_nifti(
+            str(raw_npy_output_dir[view]),
+            str(volume_out_dir[view]),
+            source_map,
+            config["stack_axis"],
+        )
+
+    inf.run_fslmaths(
+        str(volume_out_dir["sag"]),
+        str(volume_out_dir["cor"]),
+        str(volume_out_dir["ax"]),
+        str(final_out_dir),
+        prefer_fsl=args.prefer_fsl,
     )
 
-    cor_dataset = inf.Dataset(
-        images_dir = raw_png_cor, 
-        preprocessing=inf.get_preprocessing(preprocessing_fn),
-        classes=['brain'],
-    )
+    maybe_write_metrics(final_out_dir, study_dir / "volumn_out", args.truth_folder, args.metrics_out)
+    print("[INFO] Inference pipeline completed.")
 
-    ax_dataset = inf.Dataset(
-        images_dir = raw_png_ax, 
-        preprocessing=inf.get_preprocessing(preprocessing_fn),
-        classes=['brain'],
-    )
-
-    for i in range(len(files_list_sag)):
-        torch.cuda.empty_cache()
-        filename = files_list_sag[i]
-        x2= inf.get_data_from_filename(filename, sag_dataset)
-        x2 = torch.tensor(x2).unsqueeze(0).repeat(32,1,1,1)
-        model_sag = model_sag.to('cuda')
-        with torch.no_grad():
-            model_sag.eval()
-            output = model_sag(x2.float().to('cuda'))
-        output = output[0].squeeze()
-        mask = ((output / output.max()) > 0.05).float().to('cpu').numpy()
-        probability = ((output - output.min()) / (output.max() - output.min())).float().to('cpu').numpy()
-        print("slice num : ", i)
-        base_name, ext = os.path.splitext(files_list_sag[i])
-        b_base = os.path.basename(base_name)
-        prob_path = os.path.join(prob_out_sag, f"{b_base}.npy")
-        mask_path = os.path.join(raw_npy_sag_output, f"{b_base}.npy")
-        np.save(prob_path, probability)
-        np.save(mask_path, mask)
-        print(f'this is base_name: {files_list_sag[i]}')
-        inf.display([x2[0].permute([1,2,0]).squeeze(), x2.squeeze(), mask], epoch=os.path.basename(base_name), save_path= None, is_inference=True, inference_path=(raw_png_output+'/sag'))
-
-    for i in range(len(files_list_cor)):
-        torch.cuda.empty_cache()
-        filename = files_list_cor[i]
-        x2= inf.get_data_from_filename(filename, cor_dataset)
-        x2 = torch.tensor(x2).unsqueeze(0).repeat(32,1,1,1)
-        model_cor = model_cor.to('cuda')
-        with torch.no_grad():
-            model_cor.eval()
-            output = model_cor(x2.float().to('cuda'))
-        output = output[0].squeeze()
-        mask = ((output / output.max()) > 0.05).float().to('cpu').numpy()
-        probability = ((output - output.min()) / (output.max() - output.min())).float().to('cpu').numpy()
-        print("slice num : ", i)
-        base_name, ext = os.path.splitext(files_list_cor[i])
-        b_base = os.path.basename(base_name)
-        prob_path = os.path.join(prob_out_cor, f"{b_base}.npy")
-        mask_path = os.path.join(raw_npy_cor_output, f"{b_base}.npy")
-        np.save(prob_path, probability)
-        np.save(mask_path, mask)
-        print(f'this is base_name: {files_list_cor[i]}')
-        inf.display([x2[0].permute([1,2,0]).squeeze(), x2.squeeze(), mask], epoch=os.path.basename(base_name), save_path= None, is_inference=True, inference_path=(raw_png_output+'/cor'))
-
-    for i in range(len(files_list_ax)):
-        torch.cuda.empty_cache()
-        filename = files_list_ax[i]
-        x2= inf.get_data_from_filename(filename, ax_dataset)
-        x2 = torch.tensor(x2).unsqueeze(0).repeat(32,1,1,1)
-        model_ax = model_ax.to('cuda')
-        with torch.no_grad():
-            model_ax.eval()
-            output = model_ax(x2.float().to('cuda'))
-        output = output[0].squeeze()
-        mask = ((output / output.max()) > 0.05).float().to('cpu').numpy()
-        probability = ((output - output.min()) / (output.max() - output.min())).float().to('cpu').numpy()
-        print("slice num : ", i)
-        base_name, ext = os.path.splitext(files_list_ax[i])
-        b_base = os.path.basename(base_name)
-        prob_path = os.path.join(prob_out_ax, f"{b_base}.npy")
-        mask_path = os.path.join(raw_npy_ax_output, f"{b_base}.npy")
-        np.save(prob_path, probability)
-        np.save(mask_path, mask)
-        print(f'this is base_name: {files_list_ax[i]}')
-        inf.display([x2[0].permute([1,2,0]).squeeze(), x2.squeeze(), mask], epoch=os.path.basename(base_name), save_path= None, is_inference=True, inference_path=(raw_png_output+'/ax'))
-
-
-    input_dir_sag = f'{args.study_name}/raw_npy_output/sag'
-    input_dir_cor = f'{args.study_name}/raw_npy_output/cor'
-    input_dir_ax = f'{args.study_name}/raw_npy_output/ax'
-    output_dir_sag = volumn_out + '/sag'
-    output_dir_cor = volumn_out + '/cor'
-    output_dir_ax = volumn_out + '/ax'
-    source_dir = args.images_dir
-    inf.stack_slices_and_save_nifti(input_dir_sag, output_dir_sag, source_dir, 2)
-    inf.stack_slices_and_save_nifti(input_dir_cor, output_dir_cor, source_dir, 1)
-    inf.stack_slices_and_save_nifti(input_dir_ax, output_dir_ax, source_dir, 0)
-
-    inf.run_fslmaths(output_dir_sag, output_dir_cor, output_dir_ax, final_out)
-    ###Uncomment if calculating metrics####
-    #outputcsv_dice = metrics_out + f'dice.csv' 
-    #outputcsv_iou = metrics_out + f'iou.csv' 
-    #inf.calc3dDice(final_out,volumn_out, truth_folder, outputcsv_dice)
-    #inf.calc3dIOU(final_out,volumn_out, truth_folder, outputcsv_iou)
-
-
-    print("\n[INFO] Done with inference pipeline (placeholder).")
 
 if __name__ == "__main__":
     main()

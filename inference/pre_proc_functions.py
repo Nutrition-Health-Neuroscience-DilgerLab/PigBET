@@ -6,8 +6,57 @@ import shutil
 from sklearn.model_selection import train_test_split
 import pandas as pd
 
-def get_img_prefixes(img_dir):
-    return {f.split('_mc_restore')[0] for f in os.listdir(img_dir) if f.endswith('mc_restore.nii.gz')}
+try:
+    from pigbet_slice_views import (
+        extract_view_slice,
+        iter_rgb_slices_from_normalized,
+        normalize_volume_to_uint8,
+    )
+except ModuleNotFoundError:
+    from inference.pigbet_slice_views import (
+        extract_view_slice,
+        iter_rgb_slices_from_normalized,
+        normalize_volume_to_uint8,
+    )
+
+NIFTI_EXTENSIONS = ('.nii.gz', '.nii')
+
+
+def strip_nii_extension(filename):
+    for ext in NIFTI_EXTENSIONS:
+        if filename.endswith(ext):
+            return filename[:-len(ext)]
+    return filename
+
+
+def derive_image_prefix(filename, img_fixed="_mc_restore"):
+    stem = strip_nii_extension(os.path.basename(filename))
+    if img_fixed:
+        if not stem.endswith(img_fixed):
+            return None
+        stem = stem[:-len(img_fixed)]
+    return stem
+
+
+def iter_matching_nifti_files(img_dir, img_fixed="_mc_restore"):
+    for filename in sorted(os.listdir(img_dir)):
+        if not filename.endswith(NIFTI_EXTENSIONS):
+            continue
+        prefix = derive_image_prefix(filename, img_fixed=img_fixed)
+        if prefix is None:
+            continue
+        yield filename, prefix
+
+
+def build_source_image_map(img_dir, img_fixed="_mc_restore"):
+    return {
+        prefix: os.path.join(img_dir, filename)
+        for filename, prefix in iter_matching_nifti_files(img_dir, img_fixed=img_fixed)
+    }
+
+
+def get_img_prefixes(img_dir, img_fixed="_mc_restore"):
+    return set(build_source_image_map(img_dir, img_fixed=img_fixed))
 
 def get_mask_prefixes(mask_dir):
     return {f.split('-mask')[0] for f in os.listdir(mask_dir) if f.endswith('-mask.nii.gz')}
@@ -28,9 +77,7 @@ def remove_unmatched_files(img_dir, mask_dir):
 
 def normalize(img):
     """Normalize image range to [0, 255]"""
-    img_min = img.min()
-    img_max = img.max()
-    return ((img - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+    return normalize_volume_to_uint8(img)
 
 def nii_to_png_sag(img_dir, img_out_dir, img_fixed = "_mc_restore",mask_dir=None, mask_out_dir=None, mask_fixed = '-mask'):
     # Ensure output directories exist
@@ -39,48 +86,28 @@ def nii_to_png_sag(img_dir, img_out_dir, img_fixed = "_mc_restore",mask_dir=None
     if mask_dir != None and mask_out_dir != None:
         if not os.path.exists(mask_out_dir):
             os.makedirs(mask_out_dir)
-    imgfixnii = img_fixed + '.nii.gz'
     mskfixnii = mask_fixed + '.nii.gz'
-    for filename in os.listdir(img_dir):
-        if imgfixnii in filename:
-            # Load img
-            img_path = os.path.join(img_dir, filename)
-            img = nib.load(img_path).get_fdata()
-            img = normalize(img)  # Normalize the entire 3D image first
-            prefix = filename.split(img_fixed)[0]
-            print(prefix)
+    for filename, prefix in iter_matching_nifti_files(img_dir, img_fixed=img_fixed):
+        img_path = os.path.join(img_dir, filename)
+        img = nib.load(img_path).get_fdata()
+        img = normalize(img)  # Normalize the entire 3D image first
+        print(f"[INFO] Converting {prefix} to sagittal slices.")
+
+        if mask_dir != None and mask_out_dir != None:
+            mask_filename = prefix + mskfixnii
+            mask_path = os.path.join(mask_dir, mask_filename)
+            mask = nib.load(mask_path).get_fdata()
+
+        for i, rgb_img in iter_rgb_slices_from_normalized(img, axis=2):
+            img_out_path = os.path.join(img_out_dir, f"{prefix}_slice{str(i).zfill(3)}.png")
+            imageio.imwrite(img_out_path, rgb_img)
 
             if mask_dir != None and mask_out_dir != None:
-                # Load mask with matching prefix
-                mask_filename = prefix + mskfixnii
-                mask_path = os.path.join(mask_dir, mask_filename)
-                mask = nib.load(mask_path).get_fdata()
+                mask_slice = (extract_view_slice(mask, axis=2, index=i) * 255).astype(np.uint8)
+                mask_out_path = os.path.join(mask_out_dir, f"{prefix}_slice{str(i).zfill(3)}_mask.png")
+                imageio.imwrite(mask_out_path, mask_slice)
 
-            # Initialize empty slice
-            empty_slice = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
-
-            # Convert to slices and save as PNG
-            for i in range(img.shape[2]):
-                # Create RGB image by stacking slices
-                if i == 0:
-                    rgb_img = np.stack([empty_slice, img[:, :, i], img[:, :, i + 1]], axis=2)
-                elif i == img.shape[2] - 1:
-                    rgb_img = np.stack([img[:, :, i - 1], img[:, :, i], empty_slice], axis=2)
-                else:
-                    rgb_img = np.stack([img[:, :, i - 1], img[:, :, i], img[:, :, i + 1]], axis=2)
-
-                img_out_path = os.path.join(img_out_dir, f"{prefix}_slice{str(i).zfill(3)}.png")
-                imageio.imwrite(img_out_path, rgb_img)
-
-                if mask_dir != None and mask_out_dir != None:
-                    # Normalize mask slice to 0-255 and save as PNG
-                    mask_slice = (mask[:, :, i] * 255).astype(np.uint8)
-                    mask_out_path = os.path.join(mask_out_dir, f"{prefix}_slice{str(i).zfill(3)}_mask.png")
-                    imageio.imwrite(mask_out_path, mask_slice)
-
-                    print(f"Processed {img_out_path} and {mask_out_path}")
-                else:
-                    print(f"Processed {img_out_path}")
+        print(f"[INFO] Saved {img.shape[2]} sagittal slices for {prefix}.")
 
 def nii_to_png_cor(img_dir, img_out_dir, img_fixed = "_mc_restore",mask_dir=None, mask_out_dir=None, mask_fixed = '-mask'):
     # Ensure output directories exist
@@ -89,48 +116,28 @@ def nii_to_png_cor(img_dir, img_out_dir, img_fixed = "_mc_restore",mask_dir=None
     if mask_dir != None and mask_out_dir != None:
         if not os.path.exists(mask_out_dir):
             os.makedirs(mask_out_dir)
-    imgfixnii = img_fixed + '.nii.gz'
     mskfixnii = mask_fixed + '.nii.gz'
-    for filename in os.listdir(img_dir):
-        if imgfixnii in filename:
-            # Load img
-            img_path = os.path.join(img_dir, filename)
-            img = nib.load(img_path).get_fdata()
-            img = normalize(img)  # Normalize the entire 3D image first
-            prefix = filename.split(img_fixed)[0]
-            print(prefix)
+    for filename, prefix in iter_matching_nifti_files(img_dir, img_fixed=img_fixed):
+        img_path = os.path.join(img_dir, filename)
+        img = nib.load(img_path).get_fdata()
+        img = normalize(img)  # Normalize the entire 3D image first
+        print(f"[INFO] Converting {prefix} to coronal slices.")
+
+        if mask_dir != None and mask_out_dir != None:
+            mask_filename = prefix + mskfixnii
+            mask_path = os.path.join(mask_dir, mask_filename)
+            mask = nib.load(mask_path).get_fdata()
+
+        for i, rgb_img in iter_rgb_slices_from_normalized(img, axis=1):
+            img_out_path = os.path.join(img_out_dir, f"{prefix}_slice{str(i).zfill(3)}.png")
+            imageio.imwrite(img_out_path, rgb_img)
 
             if mask_dir != None and mask_out_dir != None:
-                # Load mask with matching prefix
-                mask_filename = prefix + mskfixnii
-                mask_path = os.path.join(mask_dir, mask_filename)
-                mask = nib.load(mask_path).get_fdata()
+                mask_slice = (extract_view_slice(mask, axis=1, index=i) * 255).astype(np.uint8)
+                mask_out_path = os.path.join(mask_out_dir, f"{prefix}_slice{str(i).zfill(3)}_mask.png")
+                imageio.imwrite(mask_out_path, mask_slice)
 
-            # Initialize empty slice
-            empty_slice = np.zeros((img.shape[0], img.shape[2]), dtype=np.uint8)
-
-            # Convert to slices and save as PNG
-            for i in range(img.shape[1]):
-                # Create RGB image by stacking slices
-                if i == 0:
-                    rgb_img = np.stack([empty_slice, img[:, i, :], img[:, i+1, :]], axis=2)
-                elif i == img.shape[1] - 1:
-                    rgb_img = np.stack([img[:, i - 1, :], img[:, i, :], empty_slice], axis=2)
-                else:
-                    rgb_img = np.stack([img[:, i - 1, :], img[:, i, :], img[:, i + 1, :]], axis=2)
-
-                img_out_path = os.path.join(img_out_dir, f"{prefix}_slice{str(i).zfill(3)}.png")
-                imageio.imwrite(img_out_path, rgb_img)
-
-                if mask_dir != None and mask_out_dir != None:
-                    # Normalize mask slice to 0-255 and save as PNG
-                    mask_slice = (mask[:, i, :] * 255).astype(np.uint8)
-                    mask_out_path = os.path.join(mask_out_dir, f"{prefix}_slice{str(i).zfill(3)}_mask.png")
-                    imageio.imwrite(mask_out_path, mask_slice)
-
-                    print(f"Processed {img_out_path} and {mask_out_path}")
-                else:
-                    print(f"Processed {img_out_path}")
+        print(f"[INFO] Saved {img.shape[1]} coronal slices for {prefix}.")
 
 
 def nii_to_png_ax(img_dir, img_out_dir, img_fixed = "_mc_restore",mask_dir=None, mask_out_dir=None, mask_fixed = '-mask'):
@@ -140,48 +147,28 @@ def nii_to_png_ax(img_dir, img_out_dir, img_fixed = "_mc_restore",mask_dir=None,
     if mask_dir != None and mask_out_dir != None:
         if not os.path.exists(mask_out_dir):
             os.makedirs(mask_out_dir)
-    imgfixnii = img_fixed + '.nii.gz'
     mskfixnii = mask_fixed + '.nii.gz'
-    for filename in os.listdir(img_dir):
-        if imgfixnii in filename:
-            # Load img
-            img_path = os.path.join(img_dir, filename)
-            img = nib.load(img_path).get_fdata()
-            img = normalize(img)  # Normalize the entire 3D image first
-            prefix = filename.split(img_fixed)[0]
-            print(prefix)
+    for filename, prefix in iter_matching_nifti_files(img_dir, img_fixed=img_fixed):
+        img_path = os.path.join(img_dir, filename)
+        img = nib.load(img_path).get_fdata()
+        img = normalize(img)  # Normalize the entire 3D image first
+        print(f"[INFO] Converting {prefix} to axial slices.")
+
+        if mask_dir != None and mask_out_dir != None:
+            mask_filename = prefix + mskfixnii
+            mask_path = os.path.join(mask_dir, mask_filename)
+            mask = nib.load(mask_path).get_fdata()
+
+        for i, rgb_img in iter_rgb_slices_from_normalized(img, axis=0):
+            img_out_path = os.path.join(img_out_dir, f"{prefix}_slice{str(i).zfill(3)}.png")
+            imageio.imwrite(img_out_path, rgb_img)
 
             if mask_dir != None and mask_out_dir != None:
-                # Load mask with matching prefix
-                mask_filename = prefix + mskfixnii
-                mask_path = os.path.join(mask_dir, mask_filename)
-                mask = nib.load(mask_path).get_fdata()
+                mask_slice = (extract_view_slice(mask, axis=0, index=i) * 255).astype(np.uint8)
+                mask_out_path = os.path.join(mask_out_dir, f"{prefix}_slice{str(i).zfill(3)}_mask.png")
+                imageio.imwrite(mask_out_path, mask_slice)
 
-            # Initialize empty slice
-            empty_slice = np.zeros((img.shape[1], img.shape[2]), dtype=np.uint8)
-
-            # Convert to slices and save as PNG
-            for i in range(img.shape[0]):
-                # Create RGB image by stacking slices
-                if i == 0:
-                    rgb_img = np.stack([empty_slice, img[i, :, :], img[i+1, :, :]], axis=2)
-                elif i == img.shape[0] - 1:
-                    rgb_img = np.stack([img[i - 1, :, :], img[i, :, :], empty_slice], axis=2)
-                else:
-                    rgb_img = np.stack([img[i - 1, :, :], img[i, :, :], img[i+1, :, :]], axis=2)
-
-                img_out_path = os.path.join(img_out_dir, f"{prefix}_slice{str(i).zfill(3)}.png")
-                imageio.imwrite(img_out_path, rgb_img)
-
-                if mask_dir != None and mask_out_dir != None:
-                    # Normalize mask slice to 0-255 and save as PNG
-                    mask_slice = (mask[i, :, :] * 255).astype(np.uint8)
-                    mask_out_path = os.path.join(mask_out_dir, f"{prefix}_slice{str(i).zfill(3)}_mask.png")
-                    imageio.imwrite(mask_out_path, mask_slice)
-
-                    print(f"Processed {img_out_path} and {mask_out_path}")
-                else:
-                    print(f"Processed {img_out_path}")
+        print(f"[INFO] Saved {img.shape[0]} axial slices for {prefix}.")
 
 def get_pig_numbers(img_dir):
     """Extract unique pig numbers from filenames in the directory."""

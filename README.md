@@ -1,105 +1,136 @@
 # PigBET
 
-**PigNii Skullstrip** is a 2.5D deep learning approach for automated segmentation (skull stripping) of pig brains from MRI images. This repository includes scripts and notebooks for both **inference** (generating segmentation masks) and **training** (building or fine‐tuning your own models via transfer learning).
-
----
-
-## Table of Contents
-1. [Overview](#overview)
-2. [Installation](#installation)
-3. [Data and Checkpoints](#data-and-checkpoints)
-4. [Usage](#usage)
-   1. [Inference via Notebook](#1-inference-via-notebook)
-   2. [Inference via-Script](#2-inference-via-script)
-   3. [Training](#3-training)
-5. [Support] (#support)
-
----
+PigBET is a 2.5D skull-stripping pipeline for pig brain MRI. It slices each 3D volume into sagittal, coronal, and axial 3-channel images, runs a segmentation model on each view, then combines the three directional masks into a final brain mask.
 
 ## Overview
 
-- **2.5D Technique**: We slice the MRI volume along sagittal, coronal, and axial planes, grouping adjacent slices to form 3‐channel images.  
-- **ImageNet‐Pretrained Encoders**: Built with [segmentation_models_pytorch (SMP)](https://github.com/qubvel/segmentation_models.pytorch).  
-- **Majority Voting**: Predictions from the three planes are combined for a final robust segmentation mask.  
-- **Transfer Learning**: You can retrain for different pig ages, modalities, or dataset specifics using minimal labeled data.
+- Orientation helper for matching new scans to the PigBET training orientation before inference.
+- Script-based inference that adapts to different input dimensions.
+- Notebook workflows for inference and training.
+- Majority-vote mask fusion with either pure Python or `fslmaths`.
 
----
+## Setup
 
-## Installation
+### macOS
 
-1. **Clone this repository**:
-   ```bash
-   git clone https://github.com/YourUsername/pignii_skullstrip.git
-   cd pignii_skullstrip
+The repo includes a bootstrap script for macOS:
 
-2. **Create a Python environment** (e.g., using conda) and install dependencies:
-   ```bash
-   conda create -n pignii_env python=3.9 -y
-   conda activate pignii_env
-   pip install -r requirements.txt
+```bash
+./scripts/setup_macos.sh
+```
 
-3. **Install FSL** To perform majority‐vote masking with fslmaths, install FSL and ensure it’s on your system PATH.
+This script creates `.venv`, installs `requirements.txt`, installs FSL with the official `getfsl.sh` flow, updates your shell config if needed, and verifies the FSL install.
 
----
+Manual setup is also fine:
 
-## Data and Checkpoints
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-We **do not** include the `example_imgs/` or `model_checkpoints/` folders in this repository. Instead, you can download them separately:
+### Linux
 
-- **Example Images** (sample `.nii.gz` files):  
-  [Download here](https://uofi.box.com/s/8i69qd5xqvrwin8w0kjr4n0nren7npfi)  
-  
+Use Python 3.11 and install the Python dependencies manually:
 
-- **Model Checkpoints** (pretrained `.pth` files):  
-  [Download here](https://uofi.box.com/s/bsxz5wmbqc42hftwixwyexxf3i97qoyo)  
-  
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-After downloading, place the sample images in a folder (e.g., `example_imgs`) and the `.pth` files in a folder (e.g., `model_checkpoints`). Update paths in your notebooks or scripts to match these locations.
+If you want the orientation helper or `fslmaths`-based mask fusion, install FSL using the official Linux instructions:
 
-## Usage
+- [FSL Linux install](https://fsl.fmrib.ox.ac.uk/fsl/docs/install/linux.html)
 
-### 1) Inference via Notebook
+### Windows
 
-1. **Open** `inference.ipynb` in Jupyter:
-   ```bash
-   jupyter notebook inference_flex.ipynb
+FSL is not a native Windows install. Use WSL and follow the Linux setup inside WSL:
 
-2. **Adjust** the paths at the top (e.g., `images_dir`, `model_sag_path`, etc.) to match your file locations. also adjust the dimension variables to match the dimensions of your images. Also make sure that images that need to be processed are ending in the same name as "image_fixed" flag in cell 3. If you cannot find the flag rename them to img_fixed = "_t1w".
+- [FSL Windows guidance](https://fsl.fmrib.ox.ac.uk/fsl/docs/install/windows.html)
 
-3. **Run** all cells.  
-   - The notebook will slice each volume into 2.5D images, run inference in all three planes, then optionally combine them via majority vote.  
-   - It can also compute metrics if you have ground‐truth masks.
+## Data And Checkpoints
 
-### 2) Inference via Script
+MRI volumes and trained model weights are not committed to this repo. The `.gitignore` excludes `.nii`, `.nii.gz`, `.pth`, and common generated outputs on purpose.
 
-1. Confirm your `.pth` files are downloaded to a known directory.
+- Example images: [Box download](https://uofi.box.com/s/8i69qd5xqvrwin8w0kjr4n0nren7npfi)
+- Pretrained checkpoints: [Box download](https://uofi.box.com/s/bsxz5wmbqc42hftwixwyexxf3i97qoyo)
 
-2. **Run** `inference.py`, for example:
-   ```bash
-   python inference.py \
-     --images_dir /path/to/example_imgs \
-     --study_name res \
-     --metrics_out results.csv \
-     --truth_folder /path/to/your_ground_truth \
-     --model_sag_path /path/to/Unet_efficientnet-b3_sag.pth \
-     --model_cor_path /path/to/Unet_efficientnet-b3_cor.pth \
-     --model_ax_path  /path/to/Unet_efficientnet-b3_ax.pth \
-     --encoder_type efficientnet-b3
+Place them anywhere convenient on your machine and pass the paths to the script or notebook.
 
-3. Results go into `<study_name>` (or however your script is set up), containing 3D masks and any metrics CSV if you specified --metrics_out.
+## Orientation Helper
 
-### 3) Training
+Use the orientation helper before inference when a scan may not match the orientation PigBET was trained on.
 
-If you want to **train** or **fine‐tune** models:
+```bash
+python inference/orientation_helper.py \
+  --input /path/to/input_image.nii.gz \
+  --fslswapdim /path/to/fslswapdim
+```
 
-1. **Open** `train.ipynb` in Jupyter.  
-2. **Point** it to your training images and ground‐truth masks.  
-3. **Make sure** your image files ends in the specified ending (example in notebook img_fixed = "_mc_restore") and your mask files ends in "-mask".
-4. **Customize** hyperparameters (epochs, encoder type, learning rate) in the first few cells.  
-5. **Run** all cells. Checkpoints (`.pth`) are saved periodically. You can then use those new weights in either the notebook or script for inference.
+What it does:
 
----
+- Generates all 48 `fslswapdim` orientation candidates, including `x y z`.
+- Uses the same PigBET slice pipeline for previews as inference preprocessing.
+- Shows the middle sagittal, coronal, and axial 2.5D views for the built-in reference and each candidate.
+- Keeps the reference visible while you browse candidate cards.
+- Marks candidates with an `L/R Flip` badge when `fslswapdim` reports a left/right flip warning.
+- Saves only the selected result, always as `.nii.gz`.
+- Cleans temporary orientation files after save.
+
+`python inference/swapdim_helper.py` launches the same GUI for backward compatibility.
+
+## Inference Script
+
+The script entrypoint is `inference/inference.py`.
+
+Example:
+
+```bash
+python inference/inference.py \
+  --images_dir /path/to/images \
+  --study_name run_001 \
+  --model_sag_path /path/to/Unet_efficientnet-b3_sag.pth \
+  --model_cor_path /path/to/Unet_efficientnet-b3_cor.pth \
+  --model_ax_path /path/to/Unet_efficientnet-b3_ax.pth \
+  --encoder_type efficientnet-b3 \
+  --device auto \
+  --image_suffix _mc_restore
+```
+
+Notes:
+
+- `--device auto` prefers CUDA, then Metal/MPS, then CPU.
+- If your files are plain `Pig_1.nii.gz`-style volumes, use `--image_suffix ""`.
+- The flex inference path pads slices to model-safe sizes and then crops predictions back to the original slice dimensions before rebuilding the 3D mask.
+- Final outputs go into `<study_name>/final_out`.
+- Directional outputs, PNG slices, probabilities, and intermediate NIfTI masks are saved under the same `<study_name>` folder.
+- FSL is optional for inference. If `fslmaths` is unavailable, PigBET falls back to Python majority voting.
+
+## Inference Notebook
+
+The inference notebook lives at `inference/inference.ipynb`.
+
+```bash
+jupyter notebook inference/inference.ipynb
+```
+
+Update the input image paths, checkpoint paths, and filename suffix settings at the top of the notebook before running it.
+
+## Training
+
+The training notebook lives at `training/train.ipynb`.
+
+```bash
+jupyter notebook training/train.ipynb
+```
+
+You will need:
+
+- training MRI volumes
+- matching `-mask.nii.gz` files
+- enough disk space for generated 2.5D slice datasets
 
 ## Support
 
-For any questions, suggestions, or issues, please [open an issue](https://github.com/Nutrition-Health-Neuroscience-DilgerLab/pignii_skullstrip/issues) on this repository or reach out via email at zimul3@illinois.edu. We're happy to help setup the pipeline for your specific situation!
+Open an issue at [Nutrition-Health-Neuroscience-DilgerLab/pignii_skullstrip](https://github.com/Nutrition-Health-Neuroscience-DilgerLab/pignii_skullstrip/issues) or contact `zimul3@illinois.edu`.
