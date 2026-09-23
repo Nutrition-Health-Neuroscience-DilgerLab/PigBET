@@ -133,4 +133,4 @@ You will need:
 
 ## Support
 
-Open an issue at [Nutrition-Health-Neuroscience-DilgerLab/pignii_skullstrip](https://github.com/Nutrition-Health-Neuroscience-DilgerLab/pignii_skullstrip/issues) or contact `zimul3@illinois.edu`.
+Open an issue at [Nutrition-Health-Neuroscience-DilgerLab/PigBET](https://github.com/Nutrition-Health-Neuroscience-DilgerLab/PigBET/issues) or contact `zimul3@illinois.edu`.
